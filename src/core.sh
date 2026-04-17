@@ -372,53 +372,71 @@ vmess_link_for_addr() {
     echo "vmess://$(echo -n "$vmess_json" | base64 -w 0)"
 }
 
+append_vmess_variant() {
+    local label=$1
+    local addr=$2
+    local share=$3
+    local existing
+    [[ ! $addr ]] && return
+    for existing in "${vmess_variant_addrs[@]}"; do
+        [[ $existing == "$addr" ]] && return
+    done
+    vmess_variant_labels+=("$label")
+    vmess_variant_addrs+=("$addr")
+    vmess_variant_urls+=("$(vmess_link_for_addr "$addr" "$share")")
+}
+
 build_vmess_variants() {
     local addr label
-    local ipv4_count=0
-    local ipv6_count=0
-    local candidate_ipv4_list=()
-    local candidate_ipv6_list=()
+    local public_ipv4_count=0
+    local public_ipv6_count=0
+    local local_ipv4_count=0
+    local local_ipv6_count=0
     vmess_variant_labels=()
+    vmess_variant_addrs=()
     vmess_variant_urls=()
     [[ $is_protocol != 'vmess' ]] && return
     collect_detected_ips
-    if [[ ${#detected_public_ipv4_list[@]} -gt 0 || ${#detected_public_ipv6_list[@]} -gt 0 ]]; then
-        candidate_ipv4_list=("${detected_public_ipv4_list[@]}")
-        candidate_ipv6_list=("${detected_public_ipv6_list[@]}")
-    else
-        candidate_ipv4_list=("${detected_ipv4_list[@]}")
-        candidate_ipv6_list=("${detected_ipv6_list[@]}")
-    fi
     if [[ $host ]]; then
-        vmess_variant_labels+=("域名")
-        vmess_variant_urls+=("$(vmess_link_for_addr "$host" "$is_share_name")")
+        append_vmess_variant "域名" "$host" "$is_share_name"
     fi
-    for addr in "${candidate_ipv4_list[@]}" "${candidate_ipv6_list[@]}"; do
+    for addr in "${detected_public_ipv4_list[@]}" "${detected_public_ipv6_list[@]}"; do
         [[ ! $addr ]] && continue
-        [[ $host && $addr == "$host" ]] && continue
         if [[ $(is_test ipv4 "$addr") ]]; then
-            ((ipv4_count++))
-            label="IPv4-${ipv4_count}"
+            ((public_ipv4_count++))
+            label="公网 IPv4-${public_ipv4_count}"
         else
-            ((ipv6_count++))
-            label="IPv6-${ipv6_count}"
+            ((public_ipv6_count++))
+            label="公网 IPv6-${public_ipv6_count}"
         fi
-        vmess_variant_labels+=("$label")
-        vmess_variant_urls+=("$(vmess_link_for_addr "$addr" "$is_share_name-$label")")
+        append_vmess_variant "$label" "$addr" "$is_share_name-$label"
+    done
+    for addr in "${detected_local_ip_list[@]}"; do
+        [[ ! $addr ]] && continue
+        if [[ $(is_test ipv4 "$addr") ]]; then
+            ((local_ipv4_count++))
+            label="局域网 IPv4-${local_ipv4_count}"
+        else
+            ((local_ipv6_count++))
+            label="局域网 IPv6-${local_ipv6_count}"
+        fi
+        append_vmess_variant "$label" "$addr" "$is_share_name-$label"
     done
     if [[ ${#vmess_variant_urls[@]} -eq 0 && $is_addr_raw ]]; then
-        vmess_variant_labels=("默认")
+        vmess_variant_labels=("默认地址")
+        vmess_variant_addrs=("$is_addr_raw")
         vmess_variant_urls=("$(vmess_link_for_addr "$is_addr_raw" "$is_share_name")")
     fi
     [[ ${#vmess_variant_urls[@]} -gt 0 ]] && is_url=${vmess_variant_urls[0]}
 }
 
 show_vmess_variants() {
-    [[ ${#vmess_variant_urls[@]} -le 1 ]] && return
+    [[ ${#vmess_variant_urls[@]} -eq 0 ]] && return
     msg "----------- VMess 多地址 -----------"
     local i
     for ((i = 0; i < ${#vmess_variant_urls[@]}; i++)); do
-        msg "${vmess_variant_labels[$i]} = \e[4;${is_color}m${vmess_variant_urls[$i]}\e[0m"
+        msg "${vmess_variant_labels[$i]} | 使用地址: ${vmess_variant_addrs[$i]}"
+        msg "\e[4;${is_color}m${vmess_variant_urls[$i]}\e[0m"
     done
 }
 
@@ -1879,6 +1897,7 @@ info() {
     is_color=44
     is_url=
     vmess_variant_labels=()
+    vmess_variant_addrs=()
     vmess_variant_urls=()
     ensure_advanced_defaults
     is_share_name=$(share_name "$is_config_name")
@@ -1964,6 +1983,10 @@ info() {
     done
     if [[ $is_url ]]; then
         msg "------------- ${info_list[13]} -------------"
+        if [[ $is_protocol == 'vmess' && ${#vmess_variant_urls[@]} -gt 0 ]]; then
+            msg "默认标签 = \e[${is_color}m${vmess_variant_labels[0]}\e[0m"
+            msg "使用地址 = \e[${is_color}m${vmess_variant_addrs[0]}\e[0m"
+        fi
         msg "\e[4;${is_color}m${is_url}\e[0m"
     fi
     show_vmess_variants
@@ -1992,11 +2015,18 @@ url_qr() {
     if [[ $is_url ]]; then
         [[ $1 == 'url' ]] && {
             msg "\n------------- $is_config_name & URL 链接 -------------"
+            if [[ $is_protocol == 'vmess' && ${#vmess_variant_urls[@]} -gt 0 ]]; then
+                msg "默认标签 = \e[${is_color}m${vmess_variant_labels[0]}\e[0m"
+                msg "使用地址 = \e[${is_color}m${vmess_variant_addrs[0]}\e[0m"
+            fi
             msg "\n\e[${is_color}m${is_url}\e[0m\n"
             show_vmess_variants
             footer_msg
         } || {
             msg "\n------------- $is_config_name & QR code 二维码 -------------"
+            if [[ $is_protocol == 'vmess' && ${#vmess_variant_urls[@]} -gt 0 ]]; then
+                msg "二维码使用地址 = \e[${is_color}m${vmess_variant_addrs[0]}\e[0m"
+            fi
             msg
             if [[ $(type -P qrencode) ]]; then
                 qrencode -t ANSI "${is_url}"
