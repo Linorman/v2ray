@@ -479,17 +479,13 @@ get_pbk() {
 }
 
 show_list() {
-    PS3=''
-    COLUMNS=1
-    select i in "$@"; do echo; done &
-    wait
-    # i=0
-    # for v in "$@"; do
-    #     ((i++))
-    #     echo "$i) $v"
-    # done
-    # echo
-
+    local i=0
+    local item
+    for item in "$@"; do
+        ((i++))
+        echo "${i}) ${item}"
+    done
+    echo
 }
 
 is_test() {
@@ -1589,11 +1585,22 @@ get() {
         [[ ! $uuid ]] && get_uuid && uuid=$tmp_uuid
         ;;
     file)
+        local is_conf_entry is_conf_name is_restore_nocasematch
         is_file_str=$2
         [[ ! $is_file_str ]] && is_file_str='.json$'
-        # is_all_json=("$(ls $is_conf_dir | grep -E $is_file_str)")
-        readarray -t is_all_json <<<"$(ls $is_conf_dir | grep -E -i "$is_file_str" | sed '/dynamic-port-.*-link/d' | head -233)" # limit max 233 lines for show.
-        [[ ! $is_all_json ]] && err "无法找到相关的配置文件: $2"
+        is_all_json=()
+        shopt -q nocasematch && is_restore_nocasematch=1
+        shopt -s nocasematch
+        for is_conf_entry in "$is_conf_dir"/*; do
+            [[ ! -f $is_conf_entry ]] && continue
+            is_conf_name=${is_conf_entry##*/}
+            [[ $is_conf_name =~ dynamic-port-.*-link ]] && continue
+            [[ ! $is_conf_name =~ $is_file_str ]] && continue
+            is_all_json+=("$is_conf_name")
+            [[ ${#is_all_json[@]} -ge 233 ]] && break # limit max 233 lines for show.
+        done
+        [[ ! $is_restore_nocasematch ]] && shopt -u nocasematch
+        [[ ${#is_all_json[@]} -eq 0 ]] && err "无法找到相关的配置文件: $2"
         [[ ${#is_all_json[@]} -eq 1 ]] && is_config_file=$is_all_json && is_auto_get_config=1
         [[ ! $is_config_file ]] && {
             [[ $is_dont_auto_exit ]] && return
