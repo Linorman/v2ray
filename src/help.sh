@@ -5,18 +5,18 @@ show_help() {
         ;;
     *)
         [[ $1 ]] && warn "未知选项 '$1'"
-        msg "$is_core_name script $is_sh_ver by $author"
+        msg "$is_core_name 脚本 $is_sh_ver"
         msg "Usage: $is_core [options]... [args]... "
         msg
         help_info=(
             "基本:"
             "   v, version                                      显示当前版本"
-            "   ip                                              返回当前主机的 IP"
+            "   ip                                              返回当前主机检测到的 IP 列表"
             # "   pbk                                             同等于 $is_core x25519"
             "   get-port                                        返回一个可用的端口\n"
             # "   ss2022                                          返回一个可用于 Shadowsocks 2022 的密码\n"
             "一般:"
-            "   a, add [protocol] [args... | auto]              添加配置"
+            "   a, add [protocol] [args... | auto] [key=value]  添加配置"
             "   c, change [name] [option] [args... | auto]      更改配置"
             "   d, del [name]                                   删除配置**"
             "   i, info [name]                                  查看配置"
@@ -33,14 +33,18 @@ show_help() {
             "   path [name] [path | auto]                       更改路径"
             "   passwd [name] [password | auto]                 更改密码"
             # "   key [name] [Private key | atuo] [Public key]    更改密钥"
+            "   remark [name] [text]                            更改备注"
+            "   listen [name] [addr]                            更改监听地址"
             "   type [name] [type | auto]                       更改伪装类型"
             "   method [name] [method | auto]                   更改加密方式"
             # "   sni [name] [ ip | domain]                       更改 serverName"
             "   seed [name] [seed | auto]                       更改 mKCP seed"
+            "   sniff [name] [on | off]                         更改嗅探状态"
             "   new [name] [...]                                更改协议"
             "   web [name] [domain]                             更改伪装网站\n"
             "进阶:"
             "   dns [...]                                       设置 DNS"
+            "   add 附加字段: remark=备注 listen=地址 sniffing=on|off seed=值"
             "   dd, ddel [name...]                              删除多个配置**"
             "   fix [name]                                      修复一个配置"
             "   fix-all                                         修复全部配置"
@@ -71,24 +75,15 @@ show_help() {
             msg "$v"
         done
         msg "谨慎使用 del, ddel, 此选项会直接删除配置; 无需确认"
-        msg "反馈问题) $(msg_ul https://github.com/${is_sh_repo}/issues) "
-        msg "文档(doc) $(msg_ul https://233boy.com/$is_core/$is_core-script/)"
         ;;
 
     esac
 }
 
 about() {
-    ####### 要点13脸吗只会改我链接的小人 #######
-    unset c n m s b
     msg
-    msg "网站: $(msg_ul https://233boy.com)"
-    msg "频道: $(msg_ul https://t.me/tg2333)"
-    msg "群组: $(msg_ul https://t.me/tg233boy)"
-    msg "Github: $(msg_ul https://github.com/${is_sh_repo})"
-    msg "Twitter: $(msg_ul https://twitter.com/ai233boy)"
-    msg "$is_core_name site: $(msg_ul https://www.v2fly.org)"
-    msg "$is_core_name core: $(msg_ul https://github.com/${is_core_repo})"
+    msg "项目仓库: $(msg_ul https://github.com/${is_sh_repo})"
+    msg "上游 V2Ray 官网: $(msg_ul https://www.v2fly.org)"
+    msg "上游 V2Ray Core: $(msg_ul https://github.com/${is_core_repo})"
     msg
-    ####### 要点13脸吗只会改我链接的小人 #######
 }

@@ -46,31 +46,63 @@ cmd=$(type -P apt-get || type -P yum)
 # wget installed or none
 is_wget=$(type -P wget)
 
-# x64
-case $(uname -m) in
-amd64 | x86_64)
-    is_jq_arch=amd64
-    is_core_arch="64"
-    ;;
-*aarch64* | *armv8*)
-    is_jq_arch=arm64
-    is_core_arch="arm64-v8a"
-    ;;
-*)
-    err "此脚本仅支持 64 位系统..."
-    ;;
-esac
+detect_arch() {
+    local machine
+    machine=$(uname -m)
 
-is_core=v2ray
-is_core_name=V2Ray
+    case "$machine" in
+    amd64 | x86_64)
+        is_jq_arch=amd64
+        is_core_arch="64"
+        ;;
+    arm64 | aarch64 | *aarch64* | *armv8*)
+        is_jq_arch=arm64
+        is_core_arch="arm64-v8a"
+        ;;
+    armv7l | armv7* | armhf)
+        is_jq_arch=armhf
+        is_core_arch="arm32-v7a"
+        ;;
+    armv6l | armv6*)
+        is_jq_arch=armel
+        is_core_arch="arm32-v6"
+        ;;
+    armv5* | armel)
+        is_jq_arch=armel
+        is_core_arch="arm32-v5"
+        ;;
+    arm)
+        if grep -qi 'armv7' /proc/cpuinfo 2>/dev/null; then
+            is_jq_arch=armhf
+            is_core_arch="arm32-v7a"
+        elif grep -qi 'armv6' /proc/cpuinfo 2>/dev/null; then
+            is_jq_arch=armel
+            is_core_arch="arm32-v6"
+        else
+            is_jq_arch=armel
+            is_core_arch="arm32-v5"
+        fi
+        ;;
+    *)
+        err "此脚本暂不支持当前架构 (${machine}). 当前支持 x86_64, arm64, armv7, armv6, armv5."
+        ;;
+    esac
+}
+
+detect_arch
+
+is_core=vcontrol
+is_core_name=vcontrol
+is_upstream_core=v2ray
+is_upstream_core_name=V2Ray
 is_core_dir=/etc/$is_core
 is_core_bin=$is_core_dir/bin/$is_core
-is_core_repo=v2fly/$is_core-core
+is_core_repo=v2fly/$is_upstream_core-core
 is_conf_dir=$is_core_dir/conf
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_dir=$is_core_dir/sh
-is_sh_repo=$author/$is_core
+is_sh_repo=$author/v2ray
 is_pkg="wget unzip"
 is_config_json=$is_core_dir/config.json
 tmp_var_lists=(
@@ -99,10 +131,30 @@ load() {
     . $is_sh_dir/src/$1
 }
 
+finalize_core_binary() {
+    local upstream_bin=$is_core_dir/bin/$is_upstream_core
+    [[ -f $upstream_bin && $upstream_bin != $is_core_bin ]] && mv -f "$upstream_bin" "$is_core_bin"
+}
+
 # wget add --no-check-certificate
 _wget() {
     [[ $proxy ]] && export https_proxy=$proxy
     wget --no-check-certificate $*
+}
+
+is_ip_value() {
+    local value=$1
+    [[ $value =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || ($value =~ ^[0-9A-Fa-f:]+$ && $value == *:* ) ]]
+}
+
+register_ip() {
+    local value
+    value=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<$1)
+    value=${value#[}
+    value=${value%]}
+    [[ ! $value || $ip ]] && return
+    is_ip_value "$value" || return
+    ip=$value
 }
 
 # print a mesage
@@ -125,10 +177,10 @@ msg() {
 # show help msg
 show_help() {
     echo -e "Usage: $0 [-f xxx | -l | -p xxx | -v xxx | -h]"
-    echo -e "  -f, --core-file <path>          自定义 $is_core_name 文件路径, e.g., -f /root/${is_core}-linux-64.zip"
+    echo -e "  -f, --core-file <path>          自定义 ${is_upstream_core_name} Core 文件路径, e.g., -f /root/${is_upstream_core}-linux-${is_core_arch}.zip"
     echo -e "  -l, --local-install             本地获取安装脚本, 使用当前目录"
     echo -e "  -p, --proxy <addr>              使用代理下载, e.g., -p http://127.0.0.1:2333"
-    echo -e "  -v, --core-version <ver>        自定义 $is_core_name 版本, e.g., -v v5.4.1"
+    echo -e "  -v, --core-version <ver>        自定义 ${is_upstream_core_name} Core 版本, e.g., -v v5.4.1"
     echo -e "  -h, --help                      显示此帮助界面\n"
 
     exit 0
@@ -161,9 +213,9 @@ install_pkg() {
 download() {
     case $1 in
     core)
-        link=https://github.com/${is_core_repo}/releases/latest/download/${is_core}-linux-${is_core_arch}.zip
-        [[ $is_core_ver ]] && link="https://github.com/${is_core_repo}/releases/download/${is_core_ver}/${is_core}-linux-${is_core_arch}.zip"
-        name=$is_core_name
+        link=https://github.com/${is_core_repo}/releases/latest/download/${is_upstream_core}-linux-${is_core_arch}.zip
+        [[ $is_core_ver ]] && link="https://github.com/${is_core_repo}/releases/download/${is_core_ver}/${is_upstream_core}-linux-${is_core_arch}.zip"
+        name="${is_core_name} 内核"
         tmpfile=$tmpcore
         is_ok=$is_core_ok
         ;;
@@ -189,8 +241,14 @@ download() {
 
 # get server ip
 get_ip() {
-    export "$(_wget -4 -qO- https://one.one.one.one/cdn-cgi/trace | grep ip=)" &>/dev/null
-    [[ -z $ip ]] && export "$(_wget -6 -qO- https://one.one.one.one/cdn-cgi/trace | grep ip=)" &>/dev/null
+    register_ip "$(_wget -4 -T 3 -t 1 -qO- https://one.one.one.one/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p')"
+    register_ip "$(_wget -4 -T 3 -t 1 -qO- https://api64.ipify.org 2>/dev/null)"
+    register_ip "$(_wget -4 -T 3 -t 1 -qO- https://ipv4.icanhazip.com 2>/dev/null)"
+    register_ip "$(_wget -6 -T 3 -t 1 -qO- https://one.one.one.one/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p')"
+    register_ip "$(_wget -6 -T 3 -t 1 -qO- https://api64.ipify.org 2>/dev/null)"
+    register_ip "$(_wget -6 -T 3 -t 1 -qO- https://ipv6.icanhazip.com 2>/dev/null)"
+    [[ ! $ip && $(type -P ip) ]] && register_ip "$(ip -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+    [[ ! $ip ]] && register_ip "$(hostname -I 2>/dev/null | awk '{print $1}')"
 }
 
 # check background tasks status
@@ -239,11 +297,11 @@ pass_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
         online)
-            err "如果想要安装旧版本, 请转到: https://github.com/233boy/v2ray/tree/old"
+            err "当前安装脚本不包含旧版本安装逻辑, 如需旧版本请切换到 old 分支使用."
             ;;
         -f | --core-file)
             [[ -z $2 ]] && {
-                err "($1) 缺少必需参数, 正确使用示例: [$1 /root/$is_core-linux-64.zip]"
+                err "($1) 缺少必需参数, 正确使用示例: [$1 /root/$is_upstream_core-linux-${is_core_arch}.zip]"
             } || [[ ! -f $2 ]] && {
                 err "($2) 不是一个常规的文件."
             }
@@ -281,17 +339,16 @@ pass_args() {
         esac
     done
     [[ $is_core_ver && $is_core_file ]] && {
-        err "无法同时自定义 ${is_core_name} 版本和 ${is_core_name} 文件."
+        err "无法同时自定义 ${is_upstream_core_name} Core 版本和 ${is_upstream_core_name} Core 文件."
     }
 }
 
 # exit and remove tmpdir
 exit_and_del_tmpdir() {
-    rm -rf $tmpdir
+    rm -rf "$tmpdir"
     [[ ! $1 ]] && {
-        msg err "哦豁.."
-        msg err "安装过程出现错误..."
-        echo -e "反馈问题) https://github.com/${is_sh_repo}/issues"
+        msg err "安装过程出现错误."
+        msg err "已中止安装并清理临时文件."
         echo
         exit 1
     }
@@ -312,7 +369,7 @@ main() {
     # show welcome msg
     clear
     echo
-    echo "........... $is_core_name script by $author .........."
+    echo "........... ${is_core_name} 安装脚本 ..........."
     echo
 
     # start installing...
@@ -324,7 +381,7 @@ main() {
     # if is_core_file, copy file
     [[ $is_core_file ]] && {
         cp -f $is_core_file $is_core_ok
-        msg warn "${yellow}${is_core_name} 文件使用 > $is_core_file${none}"
+        msg warn "${yellow}${is_upstream_core_name} Core 文件使用 > $is_core_file${none}"
     }
     # local dir install sh script
     [[ $local_install ]] && {
@@ -334,7 +391,7 @@ main() {
 
     timedatectl set-ntp true &>/dev/null
     [[ $? != 0 ]] && {
-        msg warn "${yellow}\e[4m提醒!!! 无法设置自动同步时间, 可能会影响使用 VMess 协议.${none}"
+        msg warn "无法启用自动时间同步, 可能影响 VMess 协议使用."
     }
 
     # install dependent pkg
@@ -364,14 +421,14 @@ main() {
     if [[ $is_core_file ]]; then
         unzip -qo $is_core_ok -d $tmpdir/testzip &>/dev/null
         [[ $? != 0 ]] && {
-            msg err "${is_core_name} 文件无法通过测试."
+            msg err "${is_upstream_core_name} Core 文件无法通过测试."
             exit_and_del_tmpdir
         }
-        for i in ${is_core} geoip.dat geosite.dat; do
+        for i in ${is_upstream_core} geoip.dat geosite.dat; do
             [[ ! -f $tmpdir/testzip/$i ]] && is_file_err=1 && break
         done
         [[ $is_file_err ]] && {
-            msg err "${is_core_name} 文件无法通过测试."
+            msg err "${is_upstream_core_name} Core 文件无法通过测试."
             exit_and_del_tmpdir
         }
     fi
@@ -400,6 +457,7 @@ main() {
     else
         unzip -qo $is_core_ok -d $is_core_dir/bin
     fi
+    finalize_core_binary
 
     # add alias
     echo "alias $is_core=$is_sh_bin" >>/root/.bashrc
@@ -409,9 +467,11 @@ main() {
 
     # jq
     [[ $jq_not_found ]] && mv -f $is_jq_ok /usr/bin/jq
+    jq_bin=$(type -P jq || echo /usr/bin/jq)
 
     # chmod
-    chmod +x $is_core_bin $is_sh_bin /usr/bin/jq
+    chmod +x "$is_core_bin" "$is_sh_bin"
+    [[ -f $jq_bin ]] && chmod +x "$jq_bin"
 
     # create log dir
     mkdir -p $is_log_dir

@@ -52,6 +52,7 @@ mainmenu=(
 )
 info_list=(
     "协议 (protocol)"
+    "备注 (remark)"
     "地址 (address)"
     "端口 (port)"
     "用户ID (id)"
@@ -71,6 +72,8 @@ info_list=(
     "指纹 (Fingerprint)"
     "公钥 (Public key)"
     "用户名 (Username)"
+    "监听地址 (listen)"
+    "嗅探 (sniffing)"
 )
 change_list=(
     "更改协议"
@@ -89,6 +92,9 @@ change_list=(
     "更改伪装网站"
     "更改 mKCP seed"
     "更改用户名 (Username)"
+    "更改备注 (Remark)"
+    "更改监听地址 (Listen)"
+    "更改嗅探状态 (Sniffing)"
 )
 servername_list=(
     www.amazon.com
@@ -111,6 +117,311 @@ msg_ul() {
     echo -e "\e[4m$@\e[0m"
 }
 
+share_name() {
+    local name=$config_tag
+    [[ ! $name ]] && name=$1
+    name=${name%.json}
+    [[ ! $name ]] && name="${is_protocol}-${net}"
+    echo "$name"
+}
+
+normalize_bool() {
+    case ${1,,} in
+    1 | on | true | yes | y | enable | enabled)
+        echo true
+        ;;
+    0 | off | false | no | n | disable | disabled)
+        echo false
+        ;;
+    esac
+}
+
+bool_label() {
+    [[ $(normalize_bool "$1") == false ]] && echo 关闭 || echo 开启
+}
+
+sanitize_remark() {
+    sed 's/[[:space:]]\+/-/g;s/[^0-9A-Za-z._:-]/-/g;s/--\+/-/g;s/^-//;s/-$//' <<<"$1"
+}
+
+prompt_optional_value() {
+    local target=$1
+    local prompt=$2
+    local current=$3
+    local reply
+    echo -ne "$prompt"
+    read reply
+    [[ ! $reply ]] && reply=$current
+    [[ $reply ]] && export "$target=$reply"
+}
+
+prompt_yes_no() {
+    local target=$1
+    local prompt=$2
+    local default=${3:-y}
+    local reply normalized
+    while :; do
+        echo -ne "$prompt"
+        read reply
+        [[ ! $reply ]] && reply=$default
+        normalized=$(normalize_bool "$reply")
+        [[ $normalized ]] && {
+            export "$target=$normalized"
+            return
+        }
+        msg "$is_err 请输入 y/n"
+    done
+}
+
+ensure_advanced_defaults() {
+    if [[ ! $listen_addr ]]; then
+        case $net in
+        ws | h2 | grpc | http)
+            listen_addr=127.0.0.1
+            ;;
+        *)
+            listen_addr=0.0.0.0
+            ;;
+        esac
+    fi
+    [[ ! $sniffing_enabled ]] && sniffing_enabled=true
+}
+
+prompt_advanced_fields() {
+    [[ $is_change || $is_gen || ($is_add_protocol_arg && ! $is_main_start) ]] && return
+    ensure_advanced_defaults
+    msg
+    msg "可选高级字段: 备注、监听地址、嗅探开关$( [[ $net == kcp ]] && echo '、mKCP seed' )"
+    prompt_yes_no is_customize_more "是否自定义更多字段? [y/N]:" n
+    [[ $is_customize_more != true ]] && return
+    prompt_optional_value config_tag "备注 (Remark, 留空保持默认): " "$config_tag"
+    [[ $config_tag ]] && config_tag=$(sanitize_remark "$config_tag")
+    while :; do
+        prompt_optional_value listen_addr "监听地址 (默认 ${listen_addr}): " "$listen_addr"
+        [[ $(is_test listen "$listen_addr") ]] && break
+        msg "$is_err 请输入正确的监听地址, 例如 0.0.0.0 / 127.0.0.1 / ::"
+    done
+    prompt_yes_no sniffing_enabled "启用嗅探 sniffing? [Y/n]:" y
+    if [[ $net == 'kcp' ]]; then
+        prompt_optional_value kcp_seed "mKCP seed (留空自动生成): " "$kcp_seed"
+    fi
+}
+
+parse_advanced_args() {
+    local pair key value normalized
+    for pair in "$@"; do
+        [[ $pair != *=* ]] && err "无法识别额外参数 ($pair), 请使用 key=value 形式."
+        key=${pair%%=*}
+        value=${pair#*=}
+        case ${key,,} in
+        remark | tag | name)
+            config_tag=$(sanitize_remark "$value")
+            ;;
+        listen | listen-addr | listen_addr)
+            [[ ! $(is_test listen "$value") ]] && err "($value) 不是有效的监听地址."
+            listen_addr=${value#[}
+            listen_addr=${listen_addr%]}
+            ;;
+        sniff | sniffing)
+            normalized=$(normalize_bool "$value")
+            [[ ! $normalized ]] && err "($value) 不是有效的 sniffing 选项, 可用 on/off."
+            sniffing_enabled=$normalized
+            ;;
+        seed | kcp-seed | kcp_seed)
+            kcp_seed=$value
+            ;;
+        *)
+            err "无法识别额外参数 key ($key). 当前支持: remark, listen, sniffing, seed"
+            ;;
+        esac
+    done
+}
+
+build_sniffing_json() {
+    ensure_advanced_defaults
+    if [[ $(normalize_bool "$sniffing_enabled") == false ]]; then
+        is_sniffing='sniffing:{enabled:false}'
+    else
+        is_sniffing='sniffing:{enabled:true,destOverride:["http","tls"]}'
+    fi
+}
+
+append_unique_ip() {
+    local value=$1
+    local bucket=$2
+    local existing
+    value=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<"$value")
+    value=${value#[}
+    value=${value%]}
+    [[ ! $(is_test ip "$value") ]] && return
+    eval "for existing in \"\${${bucket}[@]}\"; do [[ \$existing == \"$value\" ]] && return; done"
+    eval "${bucket}+=(\"\$value\")"
+}
+
+register_detected_ip() {
+    local value=$1
+    local scope=${2:-public}
+    append_unique_ip "$value" detected_ip_list
+    if [[ $(is_test ipv4 "$value") ]]; then
+        append_unique_ip "$value" detected_ipv4_list
+        [[ $scope == public ]] && append_unique_ip "$value" detected_public_ipv4_list
+        [[ ! $primary_ipv4 ]] && primary_ipv4=$value
+    else
+        append_unique_ip "$value" detected_ipv6_list
+        [[ $scope == public ]] && append_unique_ip "$value" detected_public_ipv6_list
+        [[ ! $primary_ipv6 ]] && primary_ipv6=$value
+    fi
+    [[ $scope == local ]] && append_unique_ip "$value" detected_local_ip_list
+}
+
+fetch_public_ip() {
+    local family_flag=$1
+    local url=$2
+    local body
+    body=$(_wget "$family_flag" -T 3 -t 1 -qO- "$url" 2>/dev/null)
+    [[ $body ]] && register_detected_ip "$body" public
+}
+
+fetch_trace_ip() {
+    local family_flag=$1
+    local body
+    body=$(_wget "$family_flag" -T 3 -t 1 -qO- https://one.one.one.one/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p')
+    [[ $body ]] && register_detected_ip "$body" public
+}
+
+collect_local_ips() {
+    local value
+    if [[ $(type -P ip) ]]; then
+        while read -r value; do
+            register_detected_ip "$value" local
+        done < <(ip -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+    fi
+    while read -r value; do
+        register_detected_ip "$value" local
+    done < <(hostname -I 2>/dev/null | tr ' ' '\n')
+}
+
+collect_detected_ips() {
+    [[ $is_detected_ips_ready ]] && return
+    detected_ip_list=()
+    detected_ipv4_list=()
+    detected_ipv6_list=()
+    detected_public_ipv4_list=()
+    detected_public_ipv6_list=()
+    detected_local_ip_list=()
+    primary_ipv4=
+    primary_ipv6=
+    fetch_trace_ip -4
+    fetch_public_ip -4 https://api64.ipify.org
+    fetch_public_ip -4 https://ipv4.icanhazip.com
+    fetch_public_ip -4 https://ifconfig.me/ip
+    fetch_trace_ip -6
+    fetch_public_ip -6 https://api64.ipify.org
+    fetch_public_ip -6 https://ipv6.icanhazip.com
+    fetch_public_ip -6 https://ifconfig.me/ip
+    collect_local_ips
+    if [[ $primary_ipv4 ]]; then
+        ip=$primary_ipv4
+    elif [[ $primary_ipv6 ]]; then
+        ip=$primary_ipv6
+    elif [[ ${#detected_ip_list[@]} -gt 0 ]]; then
+        ip=${detected_ip_list[0]}
+    fi
+    is_detected_ips_ready=1
+}
+
+print_detected_ips() {
+    collect_detected_ips
+    [[ ! $ip ]] && err "获取服务器 IP 失败.."
+    msg "主 IP = $ip"
+    if [[ ${#detected_ipv4_list[@]} -gt 0 ]]; then
+        msg "IPv4 列表:"
+        for v in "${detected_ipv4_list[@]}"; do
+            msg "  - $v"
+        done
+    fi
+    if [[ ${#detected_ipv6_list[@]} -gt 0 ]]; then
+        msg "IPv6 列表:"
+        for v in "${detected_ipv6_list[@]}"; do
+            msg "  - $v"
+        done
+    fi
+    if [[ ${#detected_local_ip_list[@]} -gt 0 ]]; then
+        msg "本地接口地址:"
+        for v in "${detected_local_ip_list[@]}"; do
+            msg "  - $v"
+        done
+    fi
+}
+
+vmess_link_for_addr() {
+    local addr=$1
+    local share=$2
+    local vmess_json
+    case $net in
+    tcp | kcp | quic)
+        vmess_json=$(jq -c '{v:2,ps:'\"$share\"',add:'\"$addr\"',port:'\"$port\"',id:'\"$uuid\"',aid:"0",net:'\"$net\"',type:'\"$header_type\"',path:'\"$kcp_seed\"'}' <<<{})
+        ;;
+    ws | h2 | grpc)
+        vmess_json=$(jq -c '{v:2,ps:'\"$share\"',add:'\"$addr\"',port:'\"$is_https_port\"',id:'\"$uuid\"',aid:"0",net:'\"$net\"',host:'\"$host\"',path:'\"$path\"',tls:"tls",sni:'\"$host\"'}' <<<{})
+        ;;
+    *)
+        return
+        ;;
+    esac
+    echo "vmess://$(echo -n "$vmess_json" | base64 -w 0)"
+}
+
+build_vmess_variants() {
+    local addr label
+    local ipv4_count=0
+    local ipv6_count=0
+    local candidate_ipv4_list=()
+    local candidate_ipv6_list=()
+    vmess_variant_labels=()
+    vmess_variant_urls=()
+    [[ $is_protocol != 'vmess' ]] && return
+    collect_detected_ips
+    if [[ ${#detected_public_ipv4_list[@]} -gt 0 || ${#detected_public_ipv6_list[@]} -gt 0 ]]; then
+        candidate_ipv4_list=("${detected_public_ipv4_list[@]}")
+        candidate_ipv6_list=("${detected_public_ipv6_list[@]}")
+    else
+        candidate_ipv4_list=("${detected_ipv4_list[@]}")
+        candidate_ipv6_list=("${detected_ipv6_list[@]}")
+    fi
+    if [[ $host ]]; then
+        vmess_variant_labels+=("域名")
+        vmess_variant_urls+=("$(vmess_link_for_addr "$host" "$is_share_name")")
+    fi
+    for addr in "${candidate_ipv4_list[@]}" "${candidate_ipv6_list[@]}"; do
+        [[ ! $addr ]] && continue
+        [[ $host && $addr == "$host" ]] && continue
+        if [[ $(is_test ipv4 "$addr") ]]; then
+            ((ipv4_count++))
+            label="IPv4-${ipv4_count}"
+        else
+            ((ipv6_count++))
+            label="IPv6-${ipv6_count}"
+        fi
+        vmess_variant_labels+=("$label")
+        vmess_variant_urls+=("$(vmess_link_for_addr "$addr" "$is_share_name-$label")")
+    done
+    if [[ ${#vmess_variant_urls[@]} -eq 0 && $is_addr_raw ]]; then
+        vmess_variant_labels=("默认")
+        vmess_variant_urls=("$(vmess_link_for_addr "$is_addr_raw" "$is_share_name")")
+    fi
+    [[ ${#vmess_variant_urls[@]} -gt 0 ]] && is_url=${vmess_variant_urls[0]}
+}
+
+show_vmess_variants() {
+    [[ ${#vmess_variant_urls[@]} -le 1 ]] && return
+    msg "----------- VMess 多地址 -----------"
+    local i
+    for ((i = 0; i < ${#vmess_variant_urls[@]}; i++)); do
+        msg "${vmess_variant_labels[$i]} = \e[4;${is_color}m${vmess_variant_urls[$i]}\e[0m"
+    done
+}
+
 # pause
 pause() {
     echo
@@ -125,8 +436,7 @@ get_uuid() {
 
 get_ip() {
     [[ $ip || $is_no_auto_tls || $is_gen || $is_dont_get_ip ]] && return
-    export "$(_wget -4 -qO- https://one.one.one.one/cdn-cgi/trace | grep ip=)" &>/dev/null
-    [[ ! $ip ]] && export "$(_wget -6 -qO- https://one.one.one.one/cdn-cgi/trace | grep ip=)" &>/dev/null
+    collect_detected_ips
     [[ ! $ip ]] && {
         err "获取服务器 IP 失败.."
     }
@@ -169,6 +479,24 @@ is_test() {
     number)
         echo $2 | grep -E '^[1-9][0-9]?+$'
         ;;
+    ipv4)
+        if [[ $2 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            local old_ifs=$IFS
+            IFS=.
+            set -- $2
+            IFS=$old_ifs
+            for octet in "$@"; do
+                [[ $octet -gt 255 ]] && return
+            done
+            echo ok
+        fi
+        ;;
+    ipv6)
+        [[ $2 =~ ^[0-9A-Fa-f:]+$ && $2 == *:* ]] && echo ok
+        ;;
+    ip)
+        [[ $(is_test ipv4 "$2") || $(is_test ipv6 "$2") ]] && echo ok
+        ;;
     port)
         if [[ $(is_test number $2) ]]; then
             [[ $2 -le 65535 ]] && echo ok
@@ -182,6 +510,11 @@ is_test() {
         ;;
     path)
         echo $2 | grep -E -i '^\/\w(\w|\-|\/)?+\w$'
+        ;;
+    listen)
+        local listen_value=${2#[}
+        listen_value=${listen_value%]}
+        [[ $listen_value == 'localhost' || $(is_test ip "$listen_value") ]] && echo ok
         ;;
     uuid)
         echo $2 | grep -E -i '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
@@ -333,19 +666,14 @@ create() {
         is_json_file=$is_conf_dir/$is_config_name
         # get json
         [[ $is_change || ! $json_str ]] && get protocol $2
-        case $net in
-        ws | h2 | grpc | http)
-            is_listen='"listen": "127.0.0.1"'
-            ;;
-        *)
-            is_listen='"listen": "0.0.0.0"'
-            ;;
-        esac
-        is_sniffing='sniffing:{enabled:true,destOverride:["http","tls"]}'
-        is_new_json=$(jq '{inbounds:[{tag:'\"$is_config_name\"',port:'"$port"','"$is_listen"',protocol:'\"$is_protocol\"','"$json_str"','"$is_sniffing"'}]}' <<<{})
+        ensure_advanced_defaults
+        build_sniffing_json
+        [[ ! $config_tag ]] && config_tag=$(share_name "$is_config_name")
+        is_listen='"listen": "'$listen_addr'"'
+        is_new_json=$(jq '{inbounds:[{tag:'\"$config_tag\"',port:'"$port"','"$is_listen"',protocol:'\"$is_protocol\"','"$json_str"','"$is_sniffing"'}]}' <<<{})
         if [[ $is_dynamic_port ]]; then
             [[ ! $is_dynamic_port_range ]] && get dynamic-port
-            is_new_dynamic_port_json=$(jq '{inbounds:[{tag:'\"$is_config_name-link.json\"',port:'\"$is_dynamic_port_range\"','"$is_listen"',protocol:"vmess",'"$is_stream"','"$is_sniffing"',allocate:{strategy:"random"}}]}' <<<{})
+            is_new_dynamic_port_json=$(jq '{inbounds:[{tag:'\"${config_tag}-dynamic\"',port:'\"$is_dynamic_port_range\"','"$is_listen"',protocol:"vmess",'"$is_stream"','"$is_sniffing"',allocate:{strategy:"random"}}]}' <<<{})
         fi
         [[ $is_test_json ]] && return # tmp test
         # only show json, dont save to file.
@@ -413,7 +741,6 @@ create() {
         is_stats='stats:{}'
         is_policy_system='system:{statsInboundUplink:true,statsInboundDownlink:true,statsOutboundUplink:true,statsOutboundDownlink:true}'
         is_policy='policy:{levels:{"0":{handshake:'"$((${tmp_port:0:1} + 1))"',connIdle:'"${tmp_port:0:3}"',uplinkOnly:'"$((${tmp_port:2:1} + 1))"',downlinkOnly:'"$((${tmp_port:3:1} + 3))"',statsUserUplink:true,statsUserDownlink:true}},'"$is_policy_system"'}'
-        is_ban_ad='{type:"field",domain:["geosite:category-ads-all"],marktag:"ban_ad",outboundTag:"block"}'
         is_ban_bt='{type:"field",protocol:["bittorrent"],marktag:"ban_bt",outboundTag:"block"}'
         is_ban_cn='{type:"field",ip:["geoip:cn"],marktag:"ban_geoip_cn",outboundTag:"block"}'
         is_openai='{type:"field",domain:["domain:openai.com"],marktag:"fix_openai",outboundTag:"direct"}'
@@ -480,6 +807,18 @@ change() {
             ;;
         seed | kcpseed | kcp-seed | kcp_seed)
             is_change_id=14
+            ;;
+        user | username)
+            is_change_id=15
+            ;;
+        remark | tag | name)
+            is_change_id=16
+            ;;
+        listen | listen-addr | listen_addr)
+            is_change_id=17
+            ;;
+        sniff | sniffing)
+            is_change_id=18
             ;;
         *)
             [[ $is_try_change ]] && return
@@ -672,9 +1011,6 @@ change() {
         [[ $is_auto ]] && is_new_servername=$is_random_servername
         [[ ! $is_new_servername ]] && ask string is_new_servername "请输入新的 serverName:"
         is_servername=$is_new_servername
-        [[ $(grep -i "^233boy.com$" <<<$is_servername) ]] && {
-            err "你干嘛～哎呦～"
-        }
         add $net
         ;;
     12)
@@ -703,13 +1039,9 @@ change() {
         [[ ! -f $is_caddy_conf/${host}.conf.add ]] && err "无法配置伪装网站."
         [[ ! $is_new_proxy_site ]] && ask string is_new_proxy_site "请输入新的伪装网站 (例如 example.com):"
         proxy_site=$(sed 's#^.*//##;s#/$##' <<<$is_new_proxy_site)
-        [[ $(grep -i "^233boy.com$" <<<$proxy_site) ]] && {
-            err "你干嘛～哎呦～"
-        } || {
-            load caddy.sh
-            caddy_config proxy
-            manage restart caddy &
-        }
+        load caddy.sh
+        caddy_config proxy
+        manage restart caddy &
         msg "\n已更新伪装网站为: $(_green $proxy_site) \n"
         ;;
     14)
@@ -725,6 +1057,36 @@ change() {
         # new socks user
         [[ ! $is_socks_user ]] && err "($is_config_file) 不支持更改用户名 (Username)."
         ask string is_socks_user "请输入新用户名 (Username):"
+        add $net
+        ;;
+    16)
+        if [[ $3 ]]; then
+            config_tag=$(sanitize_remark "$3")
+        else
+            prompt_optional_value config_tag "请输入新备注 (Remark): " "$config_tag"
+            [[ $config_tag ]] && config_tag=$(sanitize_remark "$config_tag")
+        fi
+        [[ ! $config_tag ]] && err "备注不能为空."
+        add $net
+        ;;
+    17)
+        if [[ $3 ]]; then
+            listen_addr=$3
+        else
+            prompt_optional_value listen_addr "请输入新的监听地址: " "$listen_addr"
+        fi
+        [[ ! $(is_test listen "$listen_addr") ]] && err "请输入正确的监听地址."
+        listen_addr=${listen_addr#[}
+        listen_addr=${listen_addr%]}
+        add $net
+        ;;
+    18)
+        if [[ $3 ]]; then
+            sniffing_enabled=$(normalize_bool "$3")
+            [[ ! $sniffing_enabled ]] && err "请输入 on/off 或 y/n."
+        else
+            prompt_yes_no sniffing_enabled "启用嗅探 sniffing? [Y/n]:" y
+        fi
         add $net
         ;;
     esac
@@ -786,9 +1148,7 @@ uninstall() {
         rm -rf $is_caddy_dir $is_caddy_bin /lib/systemd/system/caddy.service
     fi
     [[ $is_install_sh ]] && return # reinstall
-    _green "\n卸载完成!"
-    msg "脚本哪里需要完善? 请反馈"
-    msg "反馈问题) $(msg_ul https://github.com/${is_sh_repo}/issues)\n"
+    _green "\n卸载完成!\n"
 }
 
 # manage run status
@@ -885,6 +1245,8 @@ api() {
 
 # add a config
 add() {
+    is_add_protocol_arg=$1
+    [[ ! $is_change ]] && unset config_tag listen_addr sniffing_enabled is_customize_more is_extra_args
     is_lower=${1,,}
     if [[ $is_lower ]]; then
         case $is_lower in
@@ -929,6 +1291,7 @@ add() {
         is_use_uuid=$3
         is_use_path=$4
         is_add_opts="[host] [uuid] [/path]"
+        is_extra_args=("${@:5}")
         ;;
     vmess*)
         is_use_port=$2
@@ -942,6 +1305,7 @@ add() {
         else
             is_add_opts="[port] [uuid] [type]"
         fi
+        is_extra_args=("${@:7}")
         ;;
     # *reality*)
     #     is_reality=1
@@ -954,12 +1318,14 @@ add() {
         is_use_pass=$3
         is_use_method=$4
         is_add_opts="[port] [password] [method]"
+        is_extra_args=("${@:5}")
         ;;
     *door)
         is_use_port=$2
         is_use_door_addr=$3
         is_use_door_port=$4
         is_add_opts="[port] [remote_addr] [remote_port]"
+        is_extra_args=("${@:5}")
         ;;
     socks)
         is_socks=1
@@ -967,10 +1333,12 @@ add() {
         is_use_socks_user=$3
         is_use_socks_pass=$4
         is_add_opts="[port] [username] [password]"
+        is_extra_args=("${@:5}")
         ;;
     *http)
         is_use_port=$2
         is_add_opts="[port]"
+        is_extra_args=("${@:3}")
         ;;
     esac
 
@@ -1086,6 +1454,8 @@ add() {
         [[ $is_use_socks_pass ]] && is_socks_pass=$is_use_socks_pass
     fi
 
+    [[ ${#is_extra_args[@]} -gt 0 ]] && parse_advanced_args "${is_extra_args[@]}"
+
     if [[ $is_use_tls ]]; then
         if [[ ! $is_no_auto_tls && ! $is_caddy && ! $is_gen ]]; then
             # test auto tls
@@ -1094,10 +1464,12 @@ add() {
                 is_http_port=$tmp_port
                 get_port
                 is_https_port=$tmp_port
-                warn "端口 (80 或 443) 已经被占用, 你也可以考虑使用 no-auto-tls"
-                msg "\e[41m no-auto-tls 帮助(help)\e[0m: $(msg_ul https://233boy.com/$is_core/no-auto-tls/)\n"
-                msg "\n Caddy 将使用非标准端口实现自动配置 TLS, HTTP:$is_http_port HTTPS:$is_https_port\n"
-                msg "请确定是否继续???"
+                warn "端口 80 或 443 已被占用."
+                msg "\nCaddy 将使用非标准端口实现自动 TLS:"
+                msg "HTTP: $is_http_port"
+                msg "HTTPS: $is_https_port"
+                msg "\n如需自行处理证书和反向代理, 可改用: $(_green "$is_core no-auto-tls ...")"
+                msg "请确认是否继续."
                 pause
             }
             is_install_caddy=1
@@ -1147,6 +1519,8 @@ add() {
         [[ ! $door_port ]] && ask string door_port "请输入目标端口:"
     fi
 
+    prompt_advanced_fields
+
     # Shadowsocks 2022
     if [[ $(grep 2022 <<<$ss_method) ]]; then
         # test ss2022 password
@@ -1183,12 +1557,13 @@ add() {
 get() {
     case $1 in
     addr)
-        is_addr=$host
-        [[ ! $is_addr ]] && {
+        is_addr_raw=$host
+        [[ ! $is_addr_raw ]] && {
             get_ip
-            is_addr=$ip
-            [[ $(grep ":" <<<$ip) ]] && is_addr="[$ip]"
+            is_addr_raw=$ip
         }
+        is_addr=$is_addr_raw
+        [[ ! $host && $(is_test ipv6 "$is_addr_raw") ]] && is_addr="[$is_addr_raw]"
         ;;
     new)
         [[ ! $host ]] && get_ip
@@ -1211,12 +1586,12 @@ get() {
         get file $2
         if [[ $is_config_file ]]; then
             is_json_str=$(cat $is_conf_dir/"$is_config_file")
-            is_json_data_base=$(jq '.inbounds[0]|.protocol,.port,.settings.clients[0].id,.settings.clients[0].password,.settings.method,.settings.password,.settings.address,.settings.port,.settings.detour.to,.settings.accounts[0].user,.settings.accounts[0].pass' <<<$is_json_str)
+            is_json_data_base=$(jq '.inbounds[0]|.tag,.listen,.sniffing.enabled,.protocol,.port,.settings.clients[0].id,.settings.clients[0].password,.settings.method,.settings.password,.settings.address,.settings.port,.settings.detour.to,.settings.accounts[0].user,.settings.accounts[0].pass' <<<$is_json_str)
             [[ $? != 0 ]] && err "无法读取此文件: $is_config_file"
             is_json_data_more=$(jq '.inbounds[0]|.streamSettings|.network,.security,.tcpSettings.header.type,.kcpSettings.seed,.kcpSettings.header.type,.quicSettings.header.type,.wsSettings.path,.httpSettings.path,.grpcSettings.serviceName' <<<$is_json_str)
             is_json_data_host=$(jq '.inbounds[0]|.streamSettings|.grpc_host,.wsSettings.headers.Host,.httpSettings.host[0]' <<<$is_json_str)
             is_json_data_reality=$(jq '.inbounds[0]|.streamSettings|.realitySettings.serverNames[0],.realitySettings.publicKey,.realitySettings.privateKey' <<<$is_json_str)
-            is_up_var_set=(null is_protocol port uuid trojan_password ss_method ss_password door_addr door_port is_dynamic_port is_socks_user is_socks_pass net is_reality tcp_type kcp_seed kcp_type quic_type ws_path h2_path grpc_path grpc_host ws_host h2_host is_servername is_public_key is_private_key)
+            is_up_var_set=(null config_tag listen_addr sniffing_enabled is_protocol port uuid trojan_password ss_method ss_password door_addr door_port is_dynamic_port is_socks_user is_socks_pass net is_reality tcp_type kcp_seed kcp_type quic_type ws_path h2_path grpc_path grpc_host ws_host h2_host is_servername is_public_key is_private_key)
             [[ $is_debug ]] && msg "\n------------- debug: $is_config_file -------------"
             i=0
             for v in $(sed 's/""/null/g;s/"//g' <<<"$is_json_data_base $is_json_data_more $is_json_data_host $is_json_data_reality"); do
@@ -1238,6 +1613,8 @@ get() {
             fi
             [[ ! $kcp_seed ]] && is_no_kcp_seed=1
             is_config_name=$is_config_file
+            [[ ! $config_tag || $config_tag == $is_config_name ]] && config_tag=
+            [[ ! $sniffing_enabled ]] && sniffing_enabled=true
             if [[ $is_dynamic_port ]]; then
                 is_dynamic_port_file=$is_conf_dir/$is_dynamic_port
                 is_dynamic_port_range=$(jq -r '.inbounds[0].port' $is_dynamic_port_file)
@@ -1266,22 +1643,22 @@ get() {
             else
                 is_server_id_json='settings:{clients:[{id:'\"$uuid\"'}]}'
             fi
-            is_client_id_json='settings:{vnext:[{address:'\"$is_addr\"',port:'"$port"',users:[{id:'\"$uuid\"'}]}]}'
+            is_client_id_json='settings:{vnext:[{address:'\"$is_addr_raw\"',port:'"$port"',users:[{id:'\"$uuid\"'}]}]}'
             ;;
         vless*)
             is_protocol=vless
             is_server_id_json='settings:{clients:[{id:'\"$uuid\"'}],decryption:"none"}'
-            is_client_id_json='settings:{vnext:[{address:'\"$is_addr\"',port:'"$port"',users:[{id:'\"$uuid\"',encryption:"none"}]}]}'
+            is_client_id_json='settings:{vnext:[{address:'\"$is_addr_raw\"',port:'"$port"',users:[{id:'\"$uuid\"',encryption:"none"}]}]}'
             if [[ $is_reality ]]; then
                 is_server_id_json='settings:{clients:[{id:'\"$uuid\"',flow:"xtls-rprx-vision"}],decryption:"none"}'
-                is_client_id_json='settings:{vnext:[{address:'\"$is_addr\"',port:'"$port"',users:[{id:'\"$uuid\"',encryption:"none",flow:"xtls-rprx-vision"}]}]}'
+                is_client_id_json='settings:{vnext:[{address:'\"$is_addr_raw\"',port:'"$port"',users:[{id:'\"$uuid\"',encryption:"none",flow:"xtls-rprx-vision"}]}]}'
             fi
             ;;
         trojan*)
             is_protocol=trojan
             [[ ! $trojan_password ]] && trojan_password=$uuid
             is_server_id_json='settings:{clients:[{password:'\"$trojan_password\"'}]}'
-            is_client_id_json='settings:{servers:[{address:'\"$is_addr\"',port:'"$port"',password:'\"$trojan_password\"'}]}'
+            is_client_id_json='settings:{servers:[{address:'\"$is_addr_raw\"',port:'"$port"',password:'\"$trojan_password\"'}]}'
             is_trojan=1
             ;;
         shadowsocks*)
@@ -1292,7 +1669,7 @@ get() {
                 ss_password=$uuid
                 [[ $(grep 2022 <<<$ss_method) ]] && ss_password=$(get ss2022)
             }
-            is_client_id_json='settings:{servers:[{address:'\"$is_addr\"',port:'"$port"',method:'\"$ss_method\"',password:'\"$ss_password\"',}]}'
+            is_client_id_json='settings:{servers:[{address:'\"$is_addr_raw\"',port:'"$port"',method:'\"$ss_method\"',password:'\"$ss_password\"',}]}'
             json_str='settings:{method:'\"$ss_method\"',password:'\"$ss_password\"',network:"tcp,udp"}'
             ;;
         dokodemo-door*)
@@ -1308,7 +1685,7 @@ get() {
         *socks*)
             is_protocol=socks
             net=socks
-            [[ ! $is_socks_user ]] && is_socks_user=233boy
+            [[ ! $is_socks_user ]] && is_socks_user=vcontrol
             [[ ! $is_socks_pass ]] && is_socks_pass=$uuid
             json_str='settings:{auth:"password",accounts:[{user:'\"$is_socks_user\"',pass:'\"$is_socks_pass\"'}],udp:true,ip:"0.0.0.0"}'
             ;;
@@ -1401,16 +1778,31 @@ get() {
         ;;
     host-test) # test host dns record; for auto *tls required.
         [[ $is_no_auto_tls || $is_gen ]] && return
-        get_ip
+        collect_detected_ips
+        host_test_ip_list=("${detected_public_ipv4_list[@]}" "${detected_public_ipv6_list[@]}")
+        [[ ${#host_test_ip_list[@]} -eq 0 ]] && host_test_ip_list=("${detected_ipv4_list[@]}" "${detected_ipv6_list[@]}")
         get ping
-        if [[ ! $(grep $ip <<<$is_host_dns) ]]; then
-            msg "\n请将 ($(_red_bg $host)) 解析到 ($(_red_bg $ip))"
+        is_dns_match=
+        for detected_host_ip in "${host_test_ip_list[@]}"; do
+            [[ $is_host_dns == *"$detected_host_ip"* ]] && is_dns_match=1 && break
+        done
+        [[ ! $is_dns_match && $ip && $is_host_dns == *"$ip"* ]] && is_dns_match=1
+        if [[ ! $is_dns_match ]]; then
+            msg "\n请将 ($(_red_bg $host)) 解析到以下任一 IP:"
+            for detected_host_ip in "${host_test_ip_list[@]}"; do
+                [[ $detected_host_ip ]] && msg "  - $(_red_bg "$detected_host_ip")"
+            done
             msg "\n如果使用 Cloudflare, 在 DNS 那; 关闭 (Proxy status / 代理状态), 即是 (DNS only / 仅限 DNS)"
             ask string y "我已经确定解析 [y]:"
             get ping
-            if [[ ! $(grep $ip <<<$is_host_dns) ]]; then
+            is_dns_match=
+            for detected_host_ip in "${host_test_ip_list[@]}"; do
+                [[ $is_host_dns == *"$detected_host_ip"* ]] && is_dns_match=1 && break
+            done
+            [[ ! $is_dns_match && $ip && $is_host_dns == *"$ip"* ]] && is_dns_match=1
+            if [[ ! $is_dns_match ]]; then
                 _cyan "\n测试结果: $is_host_dns"
-                err "域名 ($host) 没有解析到 ($ip)"
+                err "域名 ($host) 没有解析到当前检测到的公网 IP."
             fi
         fi
         ;;
@@ -1419,12 +1811,8 @@ get() {
         [[ $? != 0 ]] && err "无法生成 Shadowsocks 2022 密码, 请安装 openssl."
         ;;
     ping)
-        # is_ip_type="-4"
-        # [[ $(grep ":" <<<$ip) ]] && is_ip_type="-6"
-        # is_host_dns=$(ping $host $is_ip_type -c 1 -W 2 | head -1)
-        is_dns_type="a"
-        [[ $(grep ":" <<<$ip) ]] && is_dns_type="aaaa"
-        is_host_dns=$(_wget -qO- --header="accept: application/dns-json" "https://one.one.one.one/dns-query?name=$host&type=$is_dns_type")
+        is_host_dns="$(_wget -qO- --header="accept: application/dns-json" "https://one.one.one.one/dns-query?name=$host&type=a")"
+        is_host_dns="$is_host_dns $(_wget -qO- --header="accept: application/dns-json" "https://one.one.one.one/dns-query?name=$host&type=aaaa")"
         ;;
     log | logerr)
         msg "\n 提醒: 按 $(_green Ctrl + C) 退出\n"
@@ -1489,76 +1877,80 @@ info() {
     fi
     # is_color=$(shuf -i 41-45 -n1)
     is_color=44
+    is_url=
+    vmess_variant_labels=()
+    vmess_variant_urls=()
+    ensure_advanced_defaults
+    is_share_name=$(share_name "$is_config_name")
     case $net in
     tcp | kcp | quic)
         is_can_change=(0 1 5 7)
-        is_info_show=(0 1 2 3 4 5)
-        is_vmess_url=$(jq -c '{v:2,ps:'\"233boy-${net}-$is_addr\"',add:'\"$is_addr\"',port:'\"$port\"',id:'\"$uuid\"',aid:"0",net:'\"$net\"',type:'\"$header_type\"',path:'\"$kcp_seed\"'}' <<<{})
-        is_url=vmess://$(echo -n $is_vmess_url | base64 -w 0)
+        is_info_show=(0 1 2 3 4 5 6 21 22)
+        build_vmess_variants
         is_tmp_port=$port
         [[ $is_dynamic_port ]] && {
             is_can_change+=(12)
             is_tmp_port="$port & 动态端口: $is_dynamic_port_range"
         }
         [[ $kcp_seed ]] && {
-            is_info_show+=(9)
+            is_info_show+=(10)
             is_can_change+=(14)
         }
-        is_info_str=($is_protocol $is_addr "$is_tmp_port" $uuid $net $header_type $kcp_seed)
+        is_info_str=($is_protocol $is_share_name $is_addr_raw "$is_tmp_port" $uuid $net $header_type $listen_addr "$(bool_label "$sniffing_enabled")" $kcp_seed)
         ;;
     ss)
         is_can_change=(0 1 4 6)
-        is_info_show=(0 1 2 10 11)
-        is_url="ss://$(echo -n ${ss_method}:${ss_password} | base64 -w 0)@${is_addr}:${port}#233boy-$net-${is_addr}"
-        is_info_str=($is_protocol $is_addr $port $ss_password $ss_method)
+        is_info_show=(0 1 2 3 11 12 21 22)
+        is_url="ss://$(echo -n ${ss_method}:${ss_password} | base64 -w 0)@${is_addr}:${port}#${is_share_name}"
+        is_info_str=($is_protocol $is_share_name $is_addr_raw $port $ss_password $ss_method $listen_addr "$(bool_label "$sniffing_enabled")")
         ;;
     ws | h2 | grpc)
         is_color=45
         is_can_change=(0 1 2 3 5)
-        is_info_show=(0 1 2 3 4 6 7 8)
+        is_info_show=(0 1 2 3 4 5 7 8 9 21 22)
         is_url_path=path
         [[ $net == 'grpc' ]] && {
             path=$(sed 's#/##g' <<<$path)
             is_url_path=serviceName
         }
         [[ $is_protocol == 'vmess' ]] && {
-            is_vmess_url=$(jq -c '{v:2,ps:'\"233boy-$net-$host\"',add:'\"$is_addr\"',port:'\"$is_https_port\"',id:'\"$uuid\"',aid:"0",net:'\"$net\"',host:'\"$host\"',path:'\"$path\"',tls:'\"tls\"'}' <<<{})
-            is_url=vmess://$(echo -n $is_vmess_url | base64 -w 0)
+            build_vmess_variants
         } || {
             [[ $is_trojan ]] && {
                 uuid=$trojan_password
                 is_can_change=(0 1 2 3 4)
-                is_info_show=(0 1 2 10 4 6 7 8)
+                is_info_show=(0 1 2 3 11 5 7 8 9 21 22)
             }
-            is_url="$is_protocol://$uuid@$host:$is_https_port?encryption=none&security=tls&type=$net&host=$host&${is_url_path}=$(sed 's#/#%2F#g' <<<$path)#233boy-$net-$host"
+            is_url="$is_protocol://$uuid@$host:$is_https_port?encryption=none&security=tls&type=$net&host=$host&${is_url_path}=$(sed 's#/#%2F#g' <<<$path)#${is_share_name}"
         }
         [[ $is_caddy ]] && is_can_change+=(13)
-        is_info_str=($is_protocol $is_addr $is_https_port $uuid $net $host $path 'tls')
+        is_info_str=($is_protocol $is_share_name $is_addr_raw $is_https_port $uuid $net $host $path 'tls' $listen_addr "$(bool_label "$sniffing_enabled")")
         ;;
     reality)
         is_color=41
         is_can_change=(0 1 5 10 11)
-        is_info_show=(0 1 2 3 15 8 16 17 18)
-        is_info_str=($is_protocol $is_addr $port $uuid xtls-rprx-vision reality $is_servername "ios" $is_public_key)
-        is_url="$is_protocol://$uuid@$is_addr:$port?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=$is_servername&pbk=$is_public_key&fp=ios#233boy-$net-$is_addr"
+        is_info_show=(0 1 2 3 4 16 5 17 18 19 21 22)
+        is_info_str=($is_protocol $is_share_name $is_addr_raw $port $uuid xtls-rprx-vision reality $is_servername "ios" $is_public_key $listen_addr "$(bool_label "$sniffing_enabled")")
+        is_url="$is_protocol://$uuid@$is_addr:$port?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=$is_servername&pbk=$is_public_key&fp=ios#${is_share_name}"
         ;;
     door)
         is_can_change=(0 1 8 9)
-        is_info_show=(0 1 2 13 14)
-        is_info_str=($is_protocol $is_addr $port $door_addr $door_port)
+        is_info_show=(0 1 2 3 14 15 21 22)
+        is_info_str=($is_protocol $is_share_name $is_addr_raw $port $door_addr $door_port $listen_addr "$(bool_label "$sniffing_enabled")")
         ;;
     socks)
         is_can_change=(0 1 15 4)
-        is_info_show=(0 1 2 19 10)
-        is_info_str=($is_protocol $is_addr $port $is_socks_user $is_socks_pass)
-        is_url="socks://$(echo -n ${is_socks_user}:${is_socks_pass} | base64 -w 0)@${is_addr}:${port}#233boy-$net-${is_addr}"
+        is_info_show=(0 1 2 3 20 11 21 22)
+        is_info_str=($is_protocol $is_share_name $is_addr_raw $port $is_socks_user $is_socks_pass $listen_addr "$(bool_label "$sniffing_enabled")")
+        is_url="socks://$(echo -n ${is_socks_user}:${is_socks_pass} | base64 -w 0)@${is_addr}:${port}#${is_share_name}"
         ;;
     http)
         is_can_change=(0 1)
-        is_info_show=(0 1 2)
-        is_info_str=($is_protocol 127.0.0.1 $port)
+        is_info_show=(0 1 2 3 21 22)
+        is_info_str=($is_protocol $is_share_name 127.0.0.1 $port $listen_addr "$(bool_label "$sniffing_enabled")")
         ;;
     esac
+    is_can_change+=(16 17 18)
     [[ $is_dont_show_info || $is_gen || $is_dont_auto_exit ]] && return # dont show info
     msg "-------------- $is_config_name -------------"
     for ((i = 0; i < ${#is_info_show[@]}; i++)); do
@@ -1570,20 +1962,18 @@ info() {
         fi
         msg "$a $tt= \e[${is_color}m${is_info_str[$i]}\e[0m"
     done
-    if [[ $is_new_install ]]; then
-        warn "首次安装请查看脚本帮助文档: $(msg_ul https://233boy.com/$is_core/$is_core-script/)"
-    fi
     if [[ $is_url ]]; then
-        msg "------------- ${info_list[12]} -------------"
+        msg "------------- ${info_list[13]} -------------"
         msg "\e[4;${is_color}m${is_url}\e[0m"
     fi
+    show_vmess_variants
     if [[ $is_no_auto_tls ]]; then
         is_tmp_path=$path
         [[ $net == 'grpc' ]] && is_tmp_path="/$path/*"
         msg "------------- no-auto-tls INFO -------------"
         msg "端口(port): $port"
         msg "路径(path): $is_tmp_path"
-        msg "\e[41m帮助(help)\e[0m: $(msg_ul https://233boy.com/$is_core/no-auto-tls/)"
+        msg "请按以上端口和路径自行配置 TLS 证书与反向代理."
     fi
     footer_msg
 }
@@ -1592,13 +1982,7 @@ info() {
 footer_msg() {
     [[ $is_core_stop && ! $is_new_json ]] && warn "$is_core_name 当前处于停止状态."
     [[ $is_caddy_stop && $host ]] && warn "Caddy 当前处于停止状态."
-    ####### 要点13脸吗只会改我链接的小人 #######
-    unset c n m s b
-    msg "------------- END -------------"
-    msg "关注(tg): $(msg_ul https://t.me/tg2333)"
-    msg "文档(doc): $(msg_ul https://233boy.com/$is_core/$is_core-script/)"
-    msg "推广(ads): 机场推荐($is_core_name services): $(msg_ul https://g${c}e${n}t${m}j${s}m${b}s.com/)\n"
-    ####### 要点13脸吗只会改我链接的小人 #######
+    msg "------------- END -------------\n"
 }
 
 # URL or qrcode
@@ -1609,19 +1993,18 @@ url_qr() {
         [[ $1 == 'url' ]] && {
             msg "\n------------- $is_config_name & URL 链接 -------------"
             msg "\n\e[${is_color}m${is_url}\e[0m\n"
+            show_vmess_variants
             footer_msg
         } || {
-            link="https://233boy.github.io/tools/qr.html#${is_url}"
             msg "\n------------- $is_config_name & QR code 二维码 -------------"
             msg
             if [[ $(type -P qrencode) ]]; then
                 qrencode -t ANSI "${is_url}"
             else
                 msg "请安装 qrencode: $(_green "$cmd update -y; $cmd install qrencode -y")"
+                msg "也可以先执行: $(_green "$is_core url $2") 查看导入链接."
             fi
             msg
-            msg "如果无法正常显示或识别, 请使用下面的链接来生成二维码:"
-            msg "\n\e[4;${is_color}m${link}\e[0m\n"
             footer_msg
         }
     else
@@ -1685,9 +2068,8 @@ update() {
 
 # main menu; if no prefer args.
 is_main_menu() {
-    msg "\n------------- $is_core_name script $is_sh_ver by $author -------------"
+    msg "\n------------- $is_core_name 脚本 $is_sh_ver -------------"
     msg "$is_core_ver: $is_core_status"
-    msg "群组 (Chat): $(msg_ul https://t.me/tg233boy)"
     is_main_start=1
     ask mainmenu
     case $REPLY in
@@ -1849,8 +2231,7 @@ main() {
         info $2
         ;;
     ip)
-        get_ip
-        msg $ip
+        print_detected_ips
         ;;
     log | logerr | errlog)
         load log.sh
@@ -1905,7 +2286,7 @@ main() {
         ;;
     v | ver | version)
         [[ $is_caddy_ver ]] && is_caddy_ver="/ $(_blue Caddy $is_caddy_ver)"
-        msg "\n$(_green $is_core_ver) / $(_cyan $is_core_name script $is_sh_ver) $is_caddy_ver\n"
+        msg "\n$(_green $is_core_ver) / $(_cyan $is_core_name 脚本 $is_sh_ver) $is_caddy_ver\n"
         ;;
     xapi)
         api ${@:2}

@@ -30,11 +30,12 @@ download() {
     mkdir -p $tmpdir
     case $1 in
     core)
-        name=$is_core_name
+        name="${is_core_name} 内核"
         tmpfile=$tmpdir/$is_core.zip
-        link="https://github.com/${is_core_repo}/releases/download/${latest_ver}/${is_core}-linux-${is_core_arch}.zip"
+        link="https://github.com/${is_core_repo}/releases/download/${latest_ver}/${is_upstream_core}-linux-${is_core_arch}.zip"
         download_file
         unzip -qo $tmpfile -d $is_core_dir/bin
+        [[ -f $is_core_dir/bin/$is_upstream_core ]] && mv -f "$is_core_dir/bin/$is_upstream_core" "$is_core_bin"
         chmod +x $is_core_bin
         ;;
     sh)

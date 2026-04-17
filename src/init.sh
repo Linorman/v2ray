@@ -61,33 +61,66 @@ _wget() {
 # yum or apt-get
 cmd=$(type -P apt-get || type -P yum)
 
-# x64
-case $(arch) in
-amd64 | x86_64)
-    is_core_arch="64"
-    caddy_arch="amd64"
-    ;;
-*aarch64* | *armv8*)
-    is_core_arch="arm64-v8a"
-    caddy_arch="arm64"
-    ;;
-*)
-    err "此脚本仅支持 64 位系统..."
-    ;;
-esac
+detect_arch() {
+    local machine
+    machine=$(uname -m)
 
-is_core=v2ray
-is_core_name=V2Ray
+    case "$machine" in
+    amd64 | x86_64)
+        is_core_arch="64"
+        caddy_arch="amd64"
+        ;;
+    arm64 | aarch64 | *aarch64* | *armv8*)
+        is_core_arch="arm64-v8a"
+        caddy_arch="arm64"
+        ;;
+    armv7l | armv7* | armhf)
+        is_core_arch="arm32-v7a"
+        caddy_arch="armv7"
+        ;;
+    armv6l | armv6*)
+        is_core_arch="arm32-v6"
+        caddy_arch="armv6"
+        ;;
+    armv5* | armel)
+        is_core_arch="arm32-v5"
+        caddy_arch="armv5"
+        ;;
+    arm)
+        if grep -qi 'armv7' /proc/cpuinfo 2>/dev/null; then
+            is_core_arch="arm32-v7a"
+            caddy_arch="armv7"
+        elif grep -qi 'armv6' /proc/cpuinfo 2>/dev/null; then
+            is_core_arch="arm32-v6"
+            caddy_arch="armv6"
+        else
+            is_core_arch="arm32-v5"
+            caddy_arch="armv5"
+        fi
+        ;;
+    *)
+        err "此脚本暂不支持当前架构 (${machine}). 当前支持 x86_64, arm64, armv7, armv6, armv5."
+        ;;
+    esac
+}
+
+detect_arch
+
+is_core=vcontrol
+is_core_name=vcontrol
+is_upstream_core=v2ray
+is_upstream_core_name=V2Ray
 is_core_dir=/etc/$is_core
 is_core_bin=$is_core_dir/bin/$is_core
-is_core_repo=v2fly/$is_core-core
+is_core_repo=v2fly/$is_upstream_core-core
 is_conf_dir=$is_core_dir/conf
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_dir=$is_core_dir/sh
-is_sh_repo=$author/$is_core
+is_sh_repo=$author/v2ray
 is_pkg="wget unzip jq qrencode"
 is_config_json=$is_core_dir/config.json
+is_core_service=/lib/systemd/system/$is_core.service
 is_caddy_bin=/usr/local/bin/caddy
 is_caddy_dir=/etc/caddy
 is_caddy_repo=caddyserver/caddy
@@ -103,14 +136,14 @@ is_core_ver=$($is_core_bin version | head -n1 | cut -d " " -f1-2)
 if [[ $(grep -o ^[0-9] <<<${is_core_ver#* }) -lt 5 ]]; then
     # core version less than 5, e.g, v4.45.2
     is_core_ver_lt_5=1
-    if [[ $(grep 'run -config' /lib/systemd/system/v2ray.service) ]]; then
-        sed -i 's/run //' /lib/systemd/system/v2ray.service
+    if [[ -f $is_core_service && $(grep 'run -config' "$is_core_service") ]]; then
+        sed -i 's/run //' "$is_core_service"
         systemctl daemon-reload
     fi
 else
     is_with_run_arg=run
-    if [[ ! $(grep 'run -config' /lib/systemd/system/v2ray.service) ]]; then
-        sed -i 's/-config/run -config/' /lib/systemd/system/v2ray.service
+    if [[ -f $is_core_service && ! $(grep 'run -config' "$is_core_service") ]]; then
+        sed -i 's/-config/run -config/' "$is_core_service"
         systemctl daemon-reload
     fi
 fi
