@@ -117,6 +117,10 @@ msg_ul() {
     echo -e "\e[4m$@\e[0m"
 }
 
+base64_nowrap() {
+    base64 | tr -d '\r\n'
+}
+
 share_name() {
     local name=$config_tag
     [[ ! $name ]] && name=$1
@@ -360,16 +364,32 @@ vmess_link_for_addr() {
     local vmess_json
     case $net in
     tcp | kcp | quic)
-        vmess_json=$(jq -c '{v:2,ps:'\"$share\"',add:'\"$addr\"',port:'\"$port\"',id:'\"$uuid\"',aid:"0",net:'\"$net\"',type:'\"$header_type\"',path:'\"$kcp_seed\"'}' <<<{})
+        vmess_json=$(jq -cn \
+            --arg ps "$share" \
+            --arg add "$addr" \
+            --arg port "$port" \
+            --arg id "$uuid" \
+            --arg net "$net" \
+            --arg type "$header_type" \
+            --arg path "$kcp_seed" \
+            '{v:2,ps:$ps,add:$add,port:$port,id:$id,aid:"0",net:$net,type:$type,path:$path}')
         ;;
     ws | h2 | grpc)
-        vmess_json=$(jq -c '{v:2,ps:'\"$share\"',add:'\"$addr\"',port:'\"$is_https_port\"',id:'\"$uuid\"',aid:"0",net:'\"$net\"',host:'\"$host\"',path:'\"$path\"',tls:"tls",sni:'\"$host\"'}' <<<{})
+        vmess_json=$(jq -cn \
+            --arg ps "$share" \
+            --arg add "$addr" \
+            --arg port "$is_https_port" \
+            --arg id "$uuid" \
+            --arg net "$net" \
+            --arg host "$host" \
+            --arg path "$path" \
+            '{v:2,ps:$ps,add:$add,port:$port,id:$id,aid:"0",net:$net,host:$host,path:$path,tls:"tls",sni:$host}')
         ;;
     *)
         return
         ;;
     esac
-    echo "vmess://$(echo -n "$vmess_json" | base64 -w 0)"
+    echo "vmess://$(echo -n "$vmess_json" | base64_nowrap)"
 }
 
 append_vmess_variant() {
@@ -1927,7 +1947,7 @@ info() {
     ss)
         is_can_change=(0 1 4 6)
         is_info_show=(0 1 2 3 11 12 21 22)
-        is_url="ss://$(echo -n ${ss_method}:${ss_password} | base64 -w 0)@${is_addr}:${port}#${is_share_name}"
+        is_url="ss://$(echo -n ${ss_method}:${ss_password} | base64_nowrap)@${is_addr}:${port}#${is_share_name}"
         is_info_str=($is_protocol $is_share_name $is_addr_raw $port $ss_password $ss_method $listen_addr "$(bool_label "$sniffing_enabled")")
         ;;
     ws | h2 | grpc)
@@ -1968,7 +1988,7 @@ info() {
         is_can_change=(0 1 15 4)
         is_info_show=(0 1 2 3 20 11 21 22)
         is_info_str=($is_protocol $is_share_name $is_addr_raw $port $is_socks_user $is_socks_pass $listen_addr "$(bool_label "$sniffing_enabled")")
-        is_url="socks://$(echo -n ${is_socks_user}:${is_socks_pass} | base64 -w 0)@${is_addr}:${port}#${is_share_name}"
+        is_url="socks://$(echo -n ${is_socks_user}:${is_socks_pass} | base64_nowrap)@${is_addr}:${port}#${is_share_name}"
         ;;
     http)
         is_can_change=(0 1)
